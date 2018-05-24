@@ -3,8 +3,34 @@
 #define LINKEDLIST_H
 #include <time.h>
 #include <stdbool.h>
-#define MAXMSG 512
-//#include <openssl/md5.h>
+#include <stdio.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/times.h>
+#include <pthread.h> 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <sys/select.h>
+#define PORT 5555
+#define MAXMSG 50
+
+#define INIT 0 
+#define WAIT_ACK 2
+#define ESTABLISHED 5
+#define WAIT_TIMEOUT 3
+
+
+#define DATA 10
+#define ACK 11
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 typedef struct
 { 
@@ -12,7 +38,7 @@ typedef struct
   int id;
   int seq; 
   int windowsize;
-  int crc;
+  uint16_t crc;
   char data[MAXMSG];
 }rtp;
 
@@ -34,8 +60,7 @@ extern bool loop;
 void addHeader(rtp *Header);
 void createHeader(rtp *Header);
 void removeHead();
-long double peekFrontTimestamp();
-int peekFrontSeqnr();
 bool checkOrder(rtp *Header);
 void printPackagelist();
+uint16_t checksum(void* indata,size_t datalength);
 #endif 

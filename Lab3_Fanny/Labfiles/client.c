@@ -1,44 +1,21 @@
-/* File: client.c
- * Trying out socket communication between processes using the Internet protocol family.
- * Usage: client [host name], that is, if a server is running on 'lab1-6.idt.mdh.se'
- * then type 'client lab1-6.idt.mdh.se' and follow the on-screen instructions.
- */
+/* File: client.c */
 
-#include <stdio.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/times.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <netdb.h>
-#include <pthread.h> 
 #include "LinkedList.h"
 
-#define PORT 5555
 #define hostNameLength 50
-#define messageLength  256
 
-#define INIT 0 
 #define WAIT_SYNACK 1  
-#define WAIT_ACK 2
-#define WAIT_TIMEOUT 3
-#define ERR 4
-#define ESTABLISHED 5
+#define WAIT_FINACK 12
 
 #define send_syn 6
 #define got_synack 7
 #define send_ack 8
 
-#define DATA 10
-#define ACK 11
-
-#define WAIT_FINACK 12
 #define send_fin 13
 #define got_finack 14
+
+/*packagelimit variable which can be changed if you want to send more packages.*/
+#define packagelimit 10
 
 void Teardown(int fileDescriptor, socklen_t size);
 
@@ -46,32 +23,10 @@ int state;
 fd_set set;
 int wsize = 2;
 struct sockaddr_in serverName;
+pthread_t thread2;
 
 //Variable for Sent Headers.
 rtp Header;
-
-/*rtp checkSum(rtp Header)
-{
-  //Digest length always 128bits
-  char hash[MD5_DIGEST_LENGTH];
-  int random;
-
-  memset(Header->crc, 0, MD5_DIGEST_LENGTH);
-  //MD5 hash function which produces a 128bit hash value
-  MD5((unsigned char *) Header, sizeof(rtp), hash);
-
-  random = (ERROR) ? rand() % 100 : 100;
-  if(random < 10) 
-  {//Error generation
-      hash[15] += 6;
-  }
-  else if(random > 30)
-  {
-      memcpy(Header->crc, hash, MD5_DIGEST_LENGTH);
-      return Header;
-  }
-  return 0;
-}*/
 
 /* initSocketAddress
  * Initialises a sockaddr_in struct given a host name and a port.
@@ -106,16 +61,62 @@ void writeMessage(int fileDescriptor, rtp message, socklen_t size)
     exit(EXIT_FAILURE);
   }
 }
+/*RandomError function
+Randomizes either corrupt, lost or wrong order on packages.*/
+void RandomError(rtp **Header, int sock, socklen_t size)
+{
+
+  int random=rand()%4;
+  switch(random)
+  {
+      case 0:
+          //Sends a normal package
+          writeMessage(sock, **Header, size);
+          break;
+      case 1:
+          //Makes a corrupted package
+          printf("////Sends corrupt package////\n");
+          rtp *WrongHeader = (rtp*)malloc(sizeof(rtp));
+          strcpy(WrongHeader->data ,"Hello\0");
+          WrongHeader->flags = DATA;
+          WrongHeader->id = 1;
+          WrongHeader->seq = (*Header)->seq;
+          WrongHeader->windowsize = wsize;
+          WrongHeader->crc = 1555;
+          writeMessage(sock, *WrongHeader, size);
+          break;
+      case 2:
+          //Makes and send a package with has seqnr 1. Probably wrong order/Lost package.
+          printf("////Sends package with wrong seqnr//////\n");
+          rtp *WrongHeader2 = (rtp*)malloc(sizeof(rtp));
+          strcpy(WrongHeader2->data ,"Hello\0");
+          WrongHeader2->flags = DATA;
+          WrongHeader2->id = 1;
+          WrongHeader2->seq = 1;
+          WrongHeader2->windowsize = wsize;
+          WrongHeader2->crc = checksum((void*)WrongHeader2, sizeof(*WrongHeader2));;
+          writeMessage(sock, *WrongHeader2, size);
+          break;
+      case 3:
+          //Sends a normal package
+          writeMessage(sock, **Header, size);
+          break;
+      case 4:
+          //Sends a normal package
+          writeMessage(sock, **Header, size);
+          break;
+  }
+
+}
 /*SendMessage
-Handling input and sending messages to file(socket).*/
-void *SendMessage(int socket, socklen_t size)
+Sending packages depending on the packagelimit. Also uses RandomError function to generate errors.*/
+void SendMessage(int socket, socklen_t size)
 {
   //Integer that keeps track of package sequence number. Is added when ever a package is sent.
   int seqnr = 0;
   /* Send data to the server */
   while(1) 
   {
-
     //Send packages aslong as we are inside the windowsize
     if(PList == NULL || ((PTail->header->seq-PList->header->seq) + 1) < wsize)
     {
@@ -133,22 +134,32 @@ void *SendMessage(int socket, socklen_t size)
       Header->seq = seqnr;
       Header->windowsize = wsize;
       Header->crc = 0;
-
-      writeMessage(socket, *Header, size);
+      Header->crc = checksum((void*)Header, sizeof(*Header));
       createHeader(Header);
+
+      RandomError(&Header, socket, size);
+
       printf("Package %d was sent to the server at timestamp %ld!\n", Header->seq, time(0));
       seqnr++;
-      if(seqnr == 10)
+      //Checks if we have sent all the packages(packagelimit).  
+      if(seqnr == packagelimit)
       {
-        sleep(20);
-        printf("\n[Client shutting down...]\n");
-        Teardown(socket, size);
-        return(NULL);
+        //Waits for the thread which handles the sliding window is done. So that we can start teardown. 
+        //which means last ACK was received then sliding window thread will terminate.
+        pthread_join(thread2, NULL);
+        if(PList == NULL)
+        {
+          printf("\n[Client shutting down...]\n");
+          Teardown(socket, size);
+          return;
+        }  
       }
 
     }
   }
 }
+/*Slidingwindow function
+Receives ACK's and checks if they are in the right order and not corrupted */
 void *Slidingwindow(void *data)
 {
   int fileDescriptor = (int)(*(int*)data);
@@ -180,34 +191,51 @@ void *Slidingwindow(void *data)
         perror("Could not read data from client\n");
         exit(EXIT_FAILURE);
       }
-
       if(nOfBytes == 0) 
         /* End of file */
         pthread_exit(NULL);
 
       if(RHeader != NULL)
       {
-        if(RHeader->seq == 9)
+        //Here we will check if the checksum is correct, that will say package hasnt been corrupted.
+        int Oldchecksum = RHeader->crc; 
+        RHeader->crc = 0;
+        int Newchecksum = checksum((void*) RHeader, sizeof(*RHeader));
+
+        if(Oldchecksum == Newchecksum)
         {
-          printf("Last ACK on package %d received, package was surely transmitted.\n", PList->header->seq);
-          removeHead();
-          printf("\n");
-          pthread_exit(NULL);
-        }
-        if((RHeader->seq == PList->header->seq && RHeader->flags == ACK ) || (RHeader->seq > PList->header->seq && RHeader->flags == ACK))
-        {
-          //Remove all packages that has gotten an ACK. Handles ACK bigger then the expected.
-          while(PList != NULL && PList->header->seq <= RHeader->seq)
+          //If its the last package in the limit, -1 because it starts on 0.
+          if(RHeader->seq == packagelimit-1)
           {
-            printf("ACK on package %d received, package was surely transmitted.\n", PList->header->seq);
+            printf("Last ACK on package %d received, package was surely transmitted.\n", PList->header->seq);
             removeHead();
+            return (NULL);
+          }
+          else
+          {
+            //Checks if ACK is in the right order and flag is ACK. 
+            if((RHeader->seq == PList->header->seq && RHeader->flags == ACK ) || (RHeader->seq > PList->header->seq && RHeader->flags == ACK))
+            {
+              //Remove all packages that has gotten an ACK. Handles ACK bigger then the expected.
+              while(PList != NULL && PList->header->seq <= RHeader->seq)
+              {
+                printf("ACK on package %d received, package was surely transmitted.\n", PList->header->seq);
+                removeHead();
+              }
+            }
+            else
+            {
+              printf("Package out of order! Dropping package.\n");
+              free(RHeader);
+            }
           }
         }
         else
         {
-          //Wrong ACK/Drop
-          printf("Package out of order! Dropping package.\n");
+          printf("Corrupted package!\n");
+          printf("[Dropping package...]\n");
           free(RHeader);
+          RHeader = NULL;
         }
       }
       else
@@ -220,8 +248,7 @@ void *Slidingwindow(void *data)
   
 }
 /* readMessage
- * Reads and prints data read from the file (socket
- * denoted by the file descriptor 'fileDescriptor'.
+ * Reads and prints data read from the socket and returns values to connection and teardown functions. 
  */
 int readMessage(int fileDescriptor, socklen_t size) 
 {
@@ -230,19 +257,20 @@ int readMessage(int fileDescriptor, socklen_t size)
   //Sets all bits of sock in set 
   FD_SET(fileDescriptor, &set);
 
-  rtp *RHeader = (rtp*)malloc(sizeof(rtp));
-  if(!RHeader)
-  {
-    printf("Could not allocate memory in Readmessage \n");
-   exit(EXIT_FAILURE);
-  }
-   int nOfBytes;
+  int nOfBytes;
   struct timeval timeout;
 
   size = sizeof(struct sockaddr_in);
 
   timeout.tv_sec = 5;
   timeout.tv_usec = 0;
+
+  rtp *RHeader = (rtp*)malloc(sizeof(rtp));
+  if(!RHeader)
+  {
+    printf("Could not allocate memory in Readmessage \n");
+    exit(EXIT_FAILURE);
+  }
 
   if(select(sizeof(int), &set, NULL, NULL, &timeout))
   {
@@ -263,41 +291,56 @@ int readMessage(int fileDescriptor, socklen_t size)
 
          if(RHeader != NULL)
           {
-            if(RHeader->flags == got_synack)
-            {
-              printf("Received SYN + ACK from server at timestamp %ld!\n", time(0));
+            int Oldchecksum = RHeader->crc; 
+            RHeader->crc = 0;
+            int Newchecksum = checksum((void*) RHeader, sizeof(*RHeader));
 
-              //If we get an ack or a synack
-              return RHeader->flags;
-            }
-            if(RHeader->flags == got_finack)
+            if(Newchecksum == Oldchecksum)
             {
-              printf("Received FIN + ACK from server at timestamp %ld!\n", time(0));
-              return RHeader->flags;
-            }
-            //Checks the order of a package
-            bool check = checkOrder(RHeader);
-
-            if((check == true && RHeader->flags == ACK ) || (RHeader->seq > PList->header->seq && RHeader->flags == ACK))
-            {
-              printf("%s\n", RHeader->data);
-              printf("%d\n", RHeader->flags);
-              printf("%d\n", RHeader->id);
-              printf("%d\n", RHeader->seq);
-              printf("%d\n", RHeader->windowsize);
-              printf("%d\n", RHeader->crc);
-              //Remove all packages that has gotten an ACK. Handles ACK bigger then the expected.
-              while(PList->header->seq <= RHeader->seq)
+              //If we got syn + ack 
+              if(RHeader->flags == got_synack)
               {
-                printf("ACK on package %d received, package was surely transmitted.\n", PList->header->seq);
-                removeHead();
+                printf("Received SYN + ACK from server at timestamp %ld!\n", time(0));
+
+                return RHeader->flags;
+              }
+              //If we got fin + ack
+              if(RHeader->flags == got_finack)
+              {
+                printf("Received FIN + ACK from server at timestamp %ld!\n", time(0));
+                return RHeader->flags;
+              }
+              //Checks the order of a package
+              bool check = checkOrder(RHeader);
+
+              if((check == true && RHeader->flags == ACK ) || (RHeader->seq > PList->header->seq && RHeader->flags == ACK))
+              {
+                printf("%s\n", RHeader->data);
+                printf("%d\n", RHeader->flags);
+                printf("%d\n", RHeader->id);
+                printf("%d\n", RHeader->seq);
+                printf("%d\n", RHeader->windowsize);
+                printf("%d\n", RHeader->crc);
+                //Remove all packages that has gotten an ACK. Handles ACK bigger then the expected.
+                while(PList->header->seq <= RHeader->seq)
+                {
+                  printf("ACK on package %d received, package was surely transmitted.\n", PList->header->seq);
+                  removeHead();
+                }
+              }
+              else
+              {
+                //Wrong ACK/Drop
+                printf("Package out of order! Dropping package.\n");
+                free(RHeader);
               }
             }
             else
             {
-              //Wrong ACK/Drop
-              printf("Package out of order! Dropping package.\n");
+              printf("Corrupted package!\n");
+              printf("[Dropping package...]\n");
               free(RHeader);
+              RHeader = NULL;
             }
           }
           else
@@ -308,10 +351,16 @@ int readMessage(int fileDescriptor, socklen_t size)
       }
       else
       {
-        //We have reached the timeout and we are connected.
+        
         printf("Timeout reached on select!\n");
-        state = ESTABLISHED;
-        return ESTABLISHED;
+        
+        if(state == WAIT_TIMEOUT)
+        {
+          //We have reached the timeout and we are connected.
+          state = ESTABLISHED;
+          return ESTABLISHED;
+        }
+
       }
       
   return(0);
@@ -334,12 +383,14 @@ void ConnectionSetup(int fileDescriptor, socklen_t size)
 
   int event = INIT;
   //Send a SYN to the server.
+  strcpy(Header.data ,"Hello\0");
   Header.flags = send_syn; 
   Header.id = 0;
   Header.seq = -1;
   Header.windowsize = wsize;
   Header.crc = 0;
- 
+  Header.crc = checksum((void*) &Header, sizeof(Header));
+
   writeMessage(fileDescriptor, Header, size);
   createHeader(&Header);
   printf("SYN sent to the server at timestamp %ld!\n", time(0));
@@ -356,12 +407,14 @@ void ConnectionSetup(int fileDescriptor, socklen_t size)
       {
         if(event == got_synack)
         {
-          //
-          event = WAIT_TIMEOUT;
+          //If we got syn+ack and want to send ack
+          state = WAIT_TIMEOUT;
           removeHead();
-          //Skicka ack
           event = INIT;
           Header.flags = send_ack; 
+          Header.crc = 0;
+          Header.crc = checksum((void*) &Header, sizeof(Header));
+        
           writeMessage(fileDescriptor, Header, size);
           printf("ACK sent to the server at timestamp %ld!\n", time(0));
           createHeader(&Header);
@@ -377,6 +430,8 @@ void ConnectionSetup(int fileDescriptor, socklen_t size)
           printf("Wait timeout but got SYN + ACK\n");
           removeHead();
           Header.flags = send_ack; 
+          Header.crc = 0;
+          Header.crc = checksum((void*) &Header, sizeof(Header));
           writeMessage(fileDescriptor, Header, size);
           printf("ACK re-sent to the server at timestamp %ld!\n", time(0));
           createHeader(&Header);
@@ -400,16 +455,18 @@ void ConnectionSetup(int fileDescriptor, socklen_t size)
 }
 /*checkTimeout-function.
 Checks if the first package in the list has exceeded the timer. That will say if it took more then
-11000 seconds for the ACK.*/
+10 seconds for the ACK.*/
 void *checkTimeout(void *data)
 {
   int size = sizeof(struct sockaddr_in);
   int fileDescriptor = (int)(*(int*)data);
+
   while(1)
   {
     if(PList != NULL)
     {
-      if(time(0) > (PList->timestamp+30))
+      //If the time right now is greater then the timestamp on the package +10 seconds.
+      if(time(0) > (PList->timestamp+10))
       {
         if(PList->header->flags == send_ack)
         {
@@ -418,7 +475,6 @@ void *checkTimeout(void *data)
           printf("Connection established\n");
           removeHead();
           PList = NULL;
-           // pthread_exit(NULL);
         }
         else
         {
@@ -426,6 +482,7 @@ void *checkTimeout(void *data)
           printf("[Resending packages...]\n");
 
           Packagelist *current = PList;
+          //Resends all packages after last ACK
           while(current != NULL)
           {
             writeMessage(fileDescriptor, (*current->header), size);
@@ -443,7 +500,8 @@ void *checkTimeout(void *data)
     }
   }
 }
-
+/*Teardown
+Function which handles the teardown*/
 void Teardown(int fileDescriptor, socklen_t size)
 {
   int event = INIT;
@@ -453,7 +511,7 @@ void Teardown(int fileDescriptor, socklen_t size)
   Header.seq = -1;
   Header.windowsize = 1;
   Header.crc = 0;
- 
+  Header.crc = checksum((void*) &Header, sizeof(Header));
   writeMessage(fileDescriptor, Header, size);
   createHeader(&Header);
   printf("FIN sent to the server at timestamp %ld!\n", time(0));
@@ -470,11 +528,13 @@ void Teardown(int fileDescriptor, socklen_t size)
       {
         if(event == got_finack)
         {
-          event = WAIT_TIMEOUT;
+          //if we got fin + ack
+          state = WAIT_TIMEOUT;
           removeHead();
-          //Skicka ack
           event = INIT;
           Header.flags = send_ack; 
+          Header.crc = 0;
+          Header.crc = checksum((void*) &Header, sizeof(Header));
           writeMessage(fileDescriptor, Header, size);
           printf("ACK sent to the server at timestamp %ld!\n", time(0));
           createHeader(&Header);
@@ -490,6 +550,8 @@ void Teardown(int fileDescriptor, socklen_t size)
           printf("Wait timeout but got FIN + ACK\n");
           removeHead();
           Header.flags = send_ack; 
+          Header.crc = 0;
+          Header.crc = checksum((void*) &Header, sizeof(Header));
           writeMessage(fileDescriptor, Header, size);
           printf("ACK re-sent to the server at timestamp %ld!\n", time(0));
           createHeader(&Header);
@@ -517,7 +579,7 @@ int main(int argc, char *argv[]) {
   char hostName[hostNameLength];
   socklen_t size;
   char input[10];
-  pthread_t thread, thread2;
+  pthread_t thread;
   int eid1, eid2;
 
   //Gives the set, zero bits for all file desctiptors
@@ -570,6 +632,7 @@ int main(int argc, char *argv[]) {
       exit(-1);
     }
     SendMessage(sock, size);
+    close(sock);
   }
   else
   {

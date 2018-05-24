@@ -1,42 +1,16 @@
-/* File: server.c
- * Trying out socket communication between processes using the Internet protocol family.
- */
+/* File: server.c */
 
-#include <stdio.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/times.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <string.h>
 #include "LinkedList.h"
-#include <stdbool.h>
-#include <pthread.h> 
 
-#define INIT 0 
 #define WAIT_SYN 1  
-#define WAIT_ACK 2
-#define TIMEOUT 3
-#define ERR 4
-#define ESTABLISHED 5
 
 #define got_syn 6
 #define send_synack 7
 #define got_ack 8
-
-#define PORT 5555
-#define MAXMSG 512
-
-#define DATA 10
-#define ACK 11
-
 #define got_fin 13
 #define send_finack 14
 
+fd_set set;
 bool loopstate = true;
 int state = WAIT_SYN;
 int expectedseq = 0;
@@ -44,6 +18,7 @@ int event = INIT;
 int wsize;
 void Teardown(int fileDescriptor, socklen_t size);
 struct sockaddr_in clientName;
+
 /* makeSocket
  * Creates and names a socket in the Internet
  * name-space. The socket created exists
@@ -101,11 +76,24 @@ void writeMessage(int fileDescriptor, rtp message, socklen_t size)
   }
 }
 /* readMessage
- * Reads and prints data read from the file (socket
- * denoted by the file descriptor 'fileDescriptor'.
+Á function which reads data from the socket. It returns different values that is used in the
+state machine functions(Connection and Teardown). For Sliding Window there is no statemachine.
+If it got a package which isnt corrupted or wrong order it will send an ACK on that package.
  */
 int readMessage(int fileDescriptor, socklen_t size) 
 {
+  //Gives the set, zero bits for all file desctiptors
+  FD_ZERO(&set);
+  //Sets all bits of sock in set 
+  FD_SET(fileDescriptor, &set);
+
+  int nOfBytes;
+  struct timeval timeout;
+
+  size = sizeof(struct sockaddr_in);
+  timeout.tv_sec = 5;
+  timeout.tv_usec = 0;
+
   rtp *RHeader = (rtp*)malloc(sizeof(rtp));
   if(!RHeader)
   {
@@ -113,70 +101,103 @@ int readMessage(int fileDescriptor, socklen_t size)
     exit(EXIT_FAILURE);
   }
 
-  int nOfBytes;
-  size = sizeof(struct sockaddr_in);
-  nOfBytes = recvfrom(fileDescriptor, RHeader, sizeof(rtp), 0, (struct sockaddr *)&clientName, &size);
-  if(nOfBytes < 0) 
+  if(select(sizeof(int), &set, NULL, NULL, &timeout))
   {
-    free(RHeader);
-    perror("Could not read data from client\n");
-    exit(EXIT_FAILURE);
-  }
-  else
-    if(nOfBytes == 0) 
-      /* End of file */
-      return(-1);
-    else 
-      /* Data read */
-
-       if(RHeader != NULL)
-        {
-          if(RHeader->flags == got_syn)
+    nOfBytes = recvfrom(fileDescriptor, RHeader, sizeof(rtp), 0, (struct sockaddr *)&clientName, &size);
+    if(nOfBytes < 0) 
+    {
+      free(RHeader);
+      perror("Closing\n");
+      exit(0);
+    }
+    else
+      if(nOfBytes == 0) 
+        /* End of file */
+        return(-1);
+      else 
+        /* Data read */
+         if(RHeader != NULL)
           {
-            printf("Received SYN from client at timestamp %ld!\n", time(0));
-            int flags = RHeader->flags;
-            free(RHeader);
-            return flags;
-          }
-          if(RHeader->flags == got_ack)
-          {
-            removeHead();
-            printf("Received ACK from client at timestamp %ld!\n", time(0));
-            int flags = RHeader->flags;
-            free(RHeader);
-            return flags;
-          }
-          if(RHeader->flags == got_fin)
-          {
-            printf("\n[Got FIN, Server shutting down...]\n");
-            Teardown(fileDescriptor, size);
-            return(0);
-          }
+              //Here we will check if the checksum is correct, that will say package hasnt been corrupted.
+              int Oldchecksum = RHeader->crc; 
+              RHeader->crc = 0;
+              int Newchecksum = checksum((void*) RHeader, sizeof(*RHeader));
+              if(Newchecksum == Oldchecksum)
+              {
+                //Some if statements for connectionsetup and teardown. 
+                if(RHeader->flags == got_syn)
+                {
+                  wsize = RHeader->windowsize;
+                  printf("Received SYN from client at timestamp %ld!\n", time(0));
+                  int flags = RHeader->flags;
+                  free(RHeader);
+                  return flags;
+                }
+                if(RHeader->flags == got_ack)
+                {
+                  removeHead();
+                  printf("Received ACK from client at timestamp %ld!\n", time(0));
+                  int flags = RHeader->flags;
+                  free(RHeader);
+                  return flags;
+                }
+                if(RHeader->flags == got_fin)
+                {
+                  printf("\n[Got FIN, Server shutting down...]\n");
+                  Teardown(fileDescriptor, size);
+                  return(0);
+                }
 
-          if(expectedseq == RHeader->seq && RHeader->flags == DATA)
-          {
-            sleep(1);
-
-            RHeader->flags = ACK;
-
-            writeMessage(fileDescriptor, *RHeader, size);
-            printf("ACK on package %d was sent to the client at timestamp %ld!\n", RHeader->seq, time(0));
-            expectedseq++;
+                //For sending ACK's back to client, sliding window. Checking expected seqnr. 
+                if(expectedseq == RHeader->seq && RHeader->flags == DATA)
+                {
+                  printf("Package %d was received at timestamp %ld!\n", RHeader->seq, time(0));
+                  sleep(1);
+                  RHeader->flags = ACK;
+                  RHeader->crc = checksum((void*) RHeader, sizeof(*RHeader));
+                  writeMessage(fileDescriptor, *RHeader, size);
+                  printf("ACK on package %d was sent to the client at timestamp %ld!\n", RHeader->seq, time(0));
+                  expectedseq++;
+                  printf("\n");
+                }
+                else
+                {
+                  printf("Package out of order!\n");
+                  printf("[Dropping package...]\n");
+                  free(RHeader);
+                  RHeader = NULL;
+                }
+              }
+              else
+              {
+                printf("Corrupted package!\n");
+                printf("[Dropping package...]\n");
+                free(RHeader);
+                RHeader = NULL;
+              }
           }
           else
           {
-            printf("Package out of order!\n");
-            printf("[Dropping package...]\n");
             free(RHeader);
+            RHeader = NULL;
+            printf("Received Empty Header.");
           }
-        }
-        else
-        {
-          free(RHeader);
-          printf("Received Empty Header.");
-        }
+  }
+  else
+    {
+      //We have reached the timeout and we are connected.
+      
+      if(state == WAIT_ACK)
+      {
+        state = WAIT_SYN;
+        return got_syn;
+      }
+
+    }
   return(0);
 }
+/*Teardown function
+State machine which handles the teardown.*/
 void Teardown(int fileDescriptor, socklen_t size)
 {
   int event = INIT;
@@ -186,11 +207,14 @@ void Teardown(int fileDescriptor, socklen_t size)
   Header.seq = -1;
   Header.windowsize = 1;
   Header.crc = 0;
- 
+  Header.crc = checksum((void*) &Header, sizeof(Header));
+
   writeMessage(fileDescriptor, Header, size);
   createHeader(&Header);
   printf("FIN + ACK sent to the server at timestamp %ld!\n", time(0));
+
   state = WAIT_ACK;
+
   while(loop == true)
   {
     //Reads events from incoming packages. 
@@ -206,6 +230,7 @@ void Teardown(int fileDescriptor, socklen_t size)
           state = ESTABLISHED;
           event = INIT;
           loopstate = false;
+          close(fileDescriptor);
           return;
         }
         break;
@@ -241,15 +266,18 @@ void ConnectionSetup(int fileDescriptor, socklen_t size)
       {
         if(event == got_syn)
         {
+          //Got syn , send syn+ack
           state = WAIT_ACK;
           event = INIT;
-          //Skicka syn + ack
+        
           Header.windowsize = wsize;
           Header.flags = send_synack;
+          Header.crc = 0;
+          Header.crc = checksum((void*) &Header, sizeof(Header));
+
           writeMessage(fileDescriptor, Header,size); 
           printf("SYN + ACK was sent to the client at timestamp %ld!\n", time(0));
           createHeader(&Header);
-          //Timer skicka om när de är slut.
         }
         break;
       }
@@ -257,6 +285,7 @@ void ConnectionSetup(int fileDescriptor, socklen_t size)
       {
         if(event == got_ack)
         {
+          //Waited for ACK and got it. We are connected.
           printf("Server is connected!\n");
           return;
         }
@@ -284,6 +313,10 @@ int main(int argc, char *argv[])
 {
   socklen_t size;
   int sock;
+  //Gives the set, zero bits for all file desctiptors
+  FD_ZERO(&set);
+  //Sets all bits of sock in set 
+  FD_SET(sock, &set);
 
   size = sizeof(struct sockaddr_in);
   /* Create a UDP socket */

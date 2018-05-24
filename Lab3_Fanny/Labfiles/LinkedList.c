@@ -8,13 +8,6 @@
 #include <stdbool.h>
 #include <pthread.h> 
 
-#define INIT 0 
-#define WAIT_SYN 1  
-#define WAIT_SYNACK 2
-#define TIMEOUT 3
-#define ERR 4
-#define ESTABLISHED 5
-
 Packagelist *PList = NULL;
 Packagelist *PTail = NULL;
 bool loop = true;
@@ -77,26 +70,12 @@ void removeHead()
 		PTail = NULL;
 		return;
 	}
-
 	Packagelist* tmp = PList;
 
 	PList = PList->next; 
 
 	free(tmp);
 }
-/*peekFrontTimestamp-functon.
-Peeks the first package of the lists timestamp.*/
-long double peekFrontTimestamp()
-{
-	return PList->timestamp;
-}
-/*peekFrontSeqnr-functon.
-Peeks the first package of the lists sequence number.*/
-int peekFrontSeqnr()
-{
-	return PList->header->seq;
-}
-
 /*checkOrder-function
 Checks if the order of a incoming package(header) is correct. Is done by
 comparing the incoming Sequence number with the first package sequence number + the windowsize. 
@@ -128,6 +107,8 @@ bool checkOrder(rtp *Header)
 	
 	return false;
 }
+/*printPackageList function
+Prints Seqnr of everything in the packagelist*/
 void printPackagelist()
 {
 	Packagelist* head = PList;
@@ -137,4 +118,44 @@ void printPackagelist()
         printf("Seq: %d\n", head->header->seq);
         head = head->next;
     }
+}
+/*Checksum function
+What it does is to divide the data of a package into a 16bit integer. 
+If this integer is bigger then 0xffff(which means 16bit) it will subtract it with 0xffff. 
+When the summation is done it will compute its bitwise complement and return it in network byte order. */
+uint16_t checksum(void* indata,size_t datalength) 
+{
+    char* data = (char*)indata;
+
+    // Initialise the sum.
+    uint32_t sum = 0xffff;
+
+    //Adds the 16bit blocks and sumates it to sum variable. 
+    for (size_t i = 0; i+1 < datalength; i += 2) 
+    {
+        uint16_t word;
+        memcpy(&word, data+i, 2);
+
+        sum += ntohs(word);
+
+        //If the sum variable is bigger then 16bits(max) it will subtract it by 16bits. 
+        if (sum > 0xffff) 
+            sum -= 0xffff;
+    }
+
+    // Handle any partial block at the end of the data.
+    //If the data summation is not evenly divideable we need to handle it.
+    if (datalength & 1) 
+    {
+        uint16_t word = 0;
+        memcpy(&word, data+datalength-1, 1);
+
+        sum += ntohs(word);
+
+        if (sum > 0xffff) 
+            sum -= 0xffff;
+    }
+
+    // Return the checksum in network byte order and ~ Means that we do a bitwise complement of the sum. Ex. 1011 will be 0100.
+    return htons(~sum);
 }
